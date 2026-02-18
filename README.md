@@ -1,2 +1,2 @@
 # novels-manga-to-epub
-Projeto criado com o objetivo de levar mangar e novels em formato .epub
+Conversor de mangás e light novels para o formato EPUB, facilitando a leitura em e-readers e dispositivos móveis.
