@@ -1,9 +1,9 @@
 import asyncio
 from src import settings
-from src.scraper import NovelScraper
-from src.manga_scraper import MangaScraper
-from src.manga_builder import build_manga_epub
-from src.epub_builder import build_epub
+from src.novel.scraper import NovelScraper
+from src.manga.manga_scraper import MangaScraper
+from src.manga.manga_builder import build_manga_epub
+from src.novel.epub_builder import build_epub
 from src.mailer import send_to_kindle
 
 

@@ -7,11 +7,10 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 # Importação da biblioteca de furtividade
-from .libs.stealth import stealth_async
-
-from .models import Novel, Chapter
-from .cleaner import clean_html_content
-from . import settings
+from src.libs.stealth import stealth_async
+from src.models import Novel, Chapter
+from src.cleaner import clean_html_content
+from src import settings
 
 
 class NovelScraper:
@@ -53,6 +52,36 @@ class NovelScraper:
         if self.playwright:
             await self.playwright.stop()
 
+    def _get_chapter_dir(self, index: int) -> Path:
+        """Define o caminho da pasta para cada capítulo (cache)."""
+        # Ex: novels_output/Nome da Novel/chapters/chap_001
+        safe_title = settings.NOVEL_TITLE.strip()
+        return settings.OUTPUT_BASE_DIR / safe_title / "chapters" / f"chap_{index:03d}"
+
+    def _save_chapter_to_disk(self, chapter_dir: Path, chapter: Chapter):
+        """Salva o conteúdo do capítulo (HTML) no disco."""
+        chapter_dir.mkdir(parents=True, exist_ok=True)
+        # Salva o texto/HTML em um arquivo txt ou html
+        file_path = chapter_dir / "content.html"
+        # Precisamos salvar o título também para reconstruir depois
+        # Uma forma simples é salvar título num arquivo separado ou usar um json
+        file_path.write_text(chapter.content, encoding="utf-8")
+        (chapter_dir / "title.txt").write_text(chapter.title, encoding="utf-8")
+        (chapter_dir / "url.txt").write_text(chapter.url, encoding="utf-8")
+
+    def _load_chapter_from_disk(self, chapter_dir: Path, index: int) -> Chapter | None:
+        """Carrega capítulo do disco se existir."""
+        content_path = chapter_dir / "content.html"
+        title_path = chapter_dir / "title.txt"
+        url_path = chapter_dir / "url.txt"
+
+        if content_path.exists() and title_path.exists():
+            content = content_path.read_text(encoding="utf-8")
+            title = title_path.read_text(encoding="utf-8")
+            url = url_path.read_text(encoding="utf-8") if url_path.exists() else ""
+            return Chapter(title=title, content=content, url=url, index=index)
+        return None
+
     async def _fetch_html_with_retry(self, url: str) -> str | None:
         """Tenta baixar o HTML com mecanismo de retry e backoff exponencial."""
         for attempt in range(1, settings.MAX_RETRIES + 1):
@@ -88,11 +117,23 @@ class NovelScraper:
 
     # ── LÓGICA DE CAPA ─────────────────────────────────────────
     async def _get_cover_image(self, index_url: str) -> bytes | None:
+        # Primeiro verifica se tem imagem salva localmente na pasta da novel (cache manual)
+        safe_title = settings.NOVEL_TITLE.strip()
+        local_cache_path = settings.OUTPUT_BASE_DIR / safe_title / "cover.jpg"
+
         if settings.COVER_MODE == "local":
             path = Path(settings.COVER_FILE_PATH)
             if path.exists():
                 return path.read_bytes()
+            # Se não achar no path configurado, tenta no cache padrão
+            if local_cache_path.exists():
+                return local_cache_path.read_bytes()
             return None
+
+        # Verifica cache automático antes de baixar
+        if local_cache_path.exists():
+            print("[Capa] Usando capa em cache do disco.")
+            return local_cache_path.read_bytes()
 
         print("[Capa] Buscando capa no site...")
         html = await self._fetch_html_with_retry(index_url)
@@ -101,7 +142,11 @@ class NovelScraper:
 
         soup = BeautifulSoup(html, "html.parser")
         img_url = None
-        for sel in settings.COVER_SELECTORS:
+        for sel in (
+            settings.COVER_SELECTORS
+        ):  # Assumindo que você tem COVER_SELECTORS no settings
+            # Se não tiver, substitua por uma lista hardcoded ou adicione no settings
+            # Ex: settings.COVER_SELECTORS = [".book-cover img", ".novel-cover img"]
             if img := soup.select_one(sel):
                 img_url = img.get("src") or img.get("data-src")
                 if img_url:
@@ -119,6 +164,9 @@ class NovelScraper:
             ) as client:
                 resp = await client.get(full_url, timeout=15)
                 if resp.status_code == 200:
+                    # Salva no cache
+                    local_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_cache_path.write_bytes(resp.content)
                     return resp.content
         except Exception:
             pass
@@ -147,6 +195,16 @@ class NovelScraper:
         return unique
 
     async def extract_chapter(self, url: str, index: int) -> Chapter | None:
+        # 1. VERIFICAÇÃO DE CACHE
+        chapter_dir = self._get_chapter_dir(index)
+        cached_chapter = self._load_chapter_from_disk(chapter_dir, index)
+
+        if cached_chapter:
+            print(f" -> [Cache] Cap {index:03d} carregado do disco.")
+            return cached_chapter
+
+        # 2. DOWNLOAD (Se não estiver no cache)
+        print(f" -> [Download] Cap {index:03d}: {url}")
         html = await self._fetch_html_with_retry(url)
         if not html:
             return None
@@ -165,10 +223,18 @@ class NovelScraper:
                 break
 
         if not content_el:
+            print(f"    [!] Conteúdo não encontrado para: {url}")
             return None
 
         clean = clean_html_content(content_el)
-        return Chapter(title=title, content=clean, url=url, index=index)
+
+        # Cria o objeto capítulo
+        chapter = Chapter(title=title, content=clean, url=url, index=index)
+
+        # 3. SALVAR NO DISCO
+        self._save_chapter_to_disk(chapter_dir, chapter)
+
+        return chapter
 
     async def run(self, start=1, end=None) -> Novel:
         novel = Novel(title=settings.NOVEL_TITLE, author=settings.NOVEL_AUTHOR)
@@ -182,24 +248,29 @@ class NovelScraper:
         target_links = links[start - 1 : end_idx]
 
         print(
-            f"[Scraper] Baixando {len(target_links)} capítulos com atraso humanizado..."
+            f"[Scraper] Processando {len(target_links)} capítulos (Cache + Download)..."
         )
 
         for i, link in enumerate(target_links, start=start):
-            print(f" -> Cap {i:03d}")
+            # A extração agora gerencia o cache internamente
             chapter = await self.extract_chapter(link, i)
+
             if chapter:
                 novel.chapters.append(chapter)
+ 
 
-            # DELAY ALEATÓRIO E HUMANIZADO
-            delay = random.uniform(
-                settings.REQUEST_DELAY_MIN, settings.REQUEST_DELAY_MAX
-            )
-            # A cada 10 capítulos, faz uma pausa maior (cafezinho do robô)
-            if i % 10 == 0:
-                print("    (Pausa para descanso de 10s...)")
-                delay = 10.0
+            # Moverei o delay para dentro do loop apenas se NÃO for cache:
+            chapter_dir = self._get_chapter_dir(i)
 
-            await asyncio.sleep(delay)
+            # Hack rápido: se a pasta do proximo capitulo não existe, sleep.
+            next_chap_dir = self._get_chapter_dir(i + 1)
+            if not next_chap_dir.exists():
+                delay = random.uniform(
+                    settings.REQUEST_DELAY_MIN, settings.REQUEST_DELAY_MAX
+                )
+                if i % 10 == 0:
+                    print("    (Pausa para descanso de 10s...)")
+                    delay = 10.0
+                await asyncio.sleep(delay)
 
         return novel

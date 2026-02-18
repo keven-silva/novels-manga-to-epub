@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 from ebooklib import epub
-from .models import Novel
+from src.models import Novel
 
 
 def sanitize_filename(name: str) -> str:
